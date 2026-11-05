@@ -16,7 +16,8 @@ from classbuild.llm import GroqClientError
 from classbuild.services.course_generator import CourseGenerator
 from classbuild.services.lesson_generator import LessonGenerator
 from classbuild.services.structured_output import CourseGenerationError
-
+from classbuild.services.quiz_generator import QuizGenerator
+from classbuild.services.quiz_grader import QuizSubmissionError, grade_quiz
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ SELECTED_LESSON_KEY = "selected_lesson"
 LESSONS_KEY = "lesson_contents"
 QUIZZES_KEY = "quizzes"
 COURSE_ID_KEY = "course_id"
-
+RESULTS_KEY = "quiz_results"
+ATTEMPTS_KEY = "quiz_attempts"
 
 def new_defaults():
     return {
@@ -36,6 +38,8 @@ def new_defaults():
         LESSONS_KEY: {},
         QUIZZES_KEY: {},
         COURSE_ID_KEY: None,
+        RESULTS_KEY: {},
+        ATTEMPTS_KEY: {},
     }
 
 
@@ -169,6 +173,7 @@ def render_lesson_section(outline):
 
     if selected in lessons:
         render_lesson_content(lessons[selected])
+        render_quiz_section(selected)
 
 
 def render_lesson_content(content):
@@ -190,7 +195,123 @@ def render_lesson_content(content):
         with st.expander(f"Hint for exercise {index}"):
             st.write(exercise.hint)
 
+def quiz_widget_prefix(lesson_number):
+    # Course id + lesson + attempt, so quizzes from different courses,
+    # lessons or attempts never share radio-button state.
+    course_id = st.session_state[COURSE_ID_KEY]
+    attempt = st.session_state[ATTEMPTS_KEY].get(lesson_number, 0)
+    return f"quiz_{course_id}_l{lesson_number}_a{attempt}"
 
+
+def retake_quiz(lesson_number):
+    """Callback for Try Again: runs before the page redraws."""
+    st.session_state[RESULTS_KEY].pop(lesson_number, None)
+    attempts = st.session_state[ATTEMPTS_KEY]
+    attempts[lesson_number] = attempts.get(lesson_number, 0) + 1
+
+
+def generate_quiz(lesson_number):
+    quizzes = st.session_state[QUIZZES_KEY]
+    if lesson_number in quizzes:
+        return True  # already generated: no API call
+
+    outline = st.session_state[OUTLINE_KEY]
+    content = st.session_state[LESSONS_KEY].get(lesson_number)
+    try:
+        with st.spinner("Generating quiz..."):
+            quiz = QuizGenerator().generate_quiz(outline, lesson_number, content)
+    except Exception as exc:
+        show_generation_error(exc)
+        return False
+
+    quizzes[lesson_number] = quiz
+    return True
+
+
+def show_question_text(number, text, bold=True):
+    # Questions can contain code after the first line, so show it as code.
+    stem, _, code = text.partition("\n")
+    st.markdown(f"**{number}. {stem}**" if bold else f"{number}. {stem}")
+    if code.strip():
+        st.code(code.strip("\n"), language="python")
+
+
+def render_quiz_section(lesson_number):
+    st.divider()
+    st.subheader("Quiz")
+
+    quizzes = st.session_state[QUIZZES_KEY]
+    if lesson_number not in quizzes:
+        course_id = st.session_state[COURSE_ID_KEY]
+        if st.button("Generate Quiz", key=f"generate_quiz_{course_id}_{lesson_number}"):
+            generate_quiz(lesson_number)
+
+    if lesson_number not in quizzes:
+        return
+
+    result = st.session_state[RESULTS_KEY].get(lesson_number)
+    if result is None:
+        render_quiz_form(lesson_number, quizzes[lesson_number])
+    else:
+        render_quiz_result(lesson_number, result)
+
+
+def render_quiz_form(lesson_number, quiz):
+    prefix = quiz_widget_prefix(lesson_number)
+    with st.form(f"{prefix}_form"):
+        for number, question in enumerate(quiz.questions, start=1):
+            show_question_text(number, question.question)
+            st.radio(
+                f"Answer for question {number}",
+                options=list(range(len(question.options))),
+                format_func=lambda index, options=question.options: options[index],
+                index=None,  # nothing pre-selected
+                key=f"{prefix}_q{number}",
+                label_visibility="collapsed",
+            )
+        submitted = st.form_submit_button("Submit Answers")
+
+    if not submitted:
+        return
+
+    answers = [
+        st.session_state.get(f"{prefix}_q{number}")
+        for number in range(1, len(quiz.questions) + 1)
+    ]
+    try:
+        result = grade_quiz(quiz, answers)  # local grading, no Groq call
+    except QuizSubmissionError as exc:
+        st.warning(str(exc))
+        return
+
+    st.session_state[RESULTS_KEY][lesson_number] = result
+    st.rerun()
+
+
+def render_quiz_result(lesson_number, result):
+    message = f"Score: {result.correct_count} / {result.total_questions} ({result.percentage:.0f}%)"
+    if result.percentage >= 80:
+        st.success(message)
+    elif result.percentage >= 50:
+        st.info(message)
+    else:
+        st.warning(message)
+
+    for item in result.question_results:
+        icon = "✅" if item.is_correct else "❌"
+        show_question_text(f"{icon} {item.number}", item.question)
+        st.write(f"Your answer: {item.selected_text}")
+        if not item.is_correct:
+            st.write(f"Correct answer: {item.correct_text}")
+        st.caption(item.explanation)
+
+    st.button(
+        "Try Again",
+        key=f"retake_{quiz_widget_prefix(lesson_number)}",
+        on_click=retake_quiz,
+        args=(lesson_number,),
+    )
+    
 def main():
     st.set_page_config(page_title="Mini ClassBuild", layout="centered")
     init_state()
