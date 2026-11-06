@@ -2,3 +2,6 @@ groq
 python-dotenv
 streamlit
 pydantic>=2
+pypdf>=4.0
+sentence-transformers>=3.0
+numpy>=1.24

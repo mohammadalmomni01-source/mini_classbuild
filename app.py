@@ -17,6 +17,10 @@ from classbuild.services.course_generator import CourseGenerator
 from classbuild.services.lesson_generator import LessonGenerator
 from classbuild.services.structured_output import CourseGenerationError
 from classbuild.services.quiz_generator import QuizGenerator
+from classbuild.rag.document_state import sync_learning_material
+from classbuild.rag.embeddings import EmbeddingError
+from classbuild.rag.retriever import RetrievalError
+from classbuild.rag.search_state import current_results, run_search
 from classbuild.services.quiz_grader import QuizSubmissionError, grade_quiz
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +32,8 @@ LESSONS_KEY = "lesson_contents"
 QUIZZES_KEY = "quizzes"
 COURSE_ID_KEY = "course_id"
 RESULTS_KEY = "quiz_results"
+UPLOADER_KEY = "pdf_uploader"
+LOW_SIMILARITY = 0.30
 ATTEMPTS_KEY = "quiz_attempts"
 
 def new_defaults():
@@ -311,11 +317,109 @@ def render_quiz_result(lesson_number, result):
         on_click=retake_quiz,
         args=(lesson_number,),
     )
-    
+
+def render_learning_materials():
+    st.subheader("Learning materials (optional)")
+    st.caption("Upload a PDF to use as reference material. It is read on your computer.")
+
+    uploaded = st.file_uploader("Upload a PDF", type=["pdf"], key=UPLOADER_KEY)
+    upload = (uploaded.name, uploaded.getvalue()) if uploaded is not None else None
+    status = sync_learning_material(st.session_state, upload)
+
+    if status.error:
+        st.error(status.error)
+        return
+    if status.document is None:
+        return
+
+    document = status.document
+    st.success(
+        f"Extracted text from {document.pages_with_text} of {document.page_count} pages "
+        f"and created {document.chunk_count} chunks."
+    )
+    render_document_summary(document)
+    render_pdf_search(document)
+
+
+def render_document_summary(document):
+    columns = st.columns(4)
+    columns[0].metric("Pages", document.page_count)
+    columns[1].metric("Words", document.word_count)
+    columns[2].metric("Chunks", document.chunk_count)
+    columns[3].metric("Pages without text", len(document.empty_pages))
+
+    if document.empty_pages:
+        pages = ", ".join(str(number) for number in document.empty_pages)
+        st.warning(f"No text could be extracted from page(s): {pages}. They may be images.")
+
+    st.caption(
+        f"Chunks are up to {document.chunk_size} characters with "
+        f"{document.chunk_overlap} characters of overlap. "
+        f"Fingerprint: {document.fingerprint[:12]}"
+    )
+
+    with st.expander("Preview chunks"):
+        shown = document.chunks[:20]
+        for chunk in shown:
+            st.markdown(
+                f"**{chunk.chunk_id}** · page {chunk.page_number} · {chunk.char_count} characters"
+            )
+            st.text(chunk.text)  # PDF text is untrusted: never render it as Markdown
+        if len(document.chunks) > len(shown):
+            st.caption(f"Showing the first {len(shown)} of {document.chunk_count} chunks.")
+def render_pdf_search(document):
+    st.markdown("#### Search the PDF")
+    st.caption(
+        "Finds the passages closest in meaning to your question. "
+        "The first search loads a small model (about 90 MB download the first time)."
+    )
+
+    # The key includes the PDF fingerprint, so a new PDF always gets fresh widgets.
+    key = f"pdf_search_{document.fingerprint[:12]}"
+    with st.form(f"{key}_form"):
+        query = st.text_input(
+            "Question",
+            key=f"{key}_query",
+            placeholder="e.g. What does dynamically typed mean in Python?",
+        )
+        submitted = st.form_submit_button("Search PDF")
+
+    if submitted:
+        try:
+            with st.spinner("Searching..."):
+                run_search(st.session_state, query)
+        except (EmbeddingError, RetrievalError) as exc:
+            st.error(str(exc))
+            return
+        except Exception:
+            logger.exception("Unexpected error during PDF search")
+            st.error("Something went wrong while searching the PDF. Please try again.")
+            return
+
+    saved = current_results(st.session_state)
+    if saved:
+        render_search_results(saved["results"])
+
+
+def render_search_results(results):
+    st.caption(f"Top {len(results)} passages for your question")
+    if results and results[0].score < LOW_SIMILARITY:
+        st.warning(
+            "These passages have low similarity, so they probably do not answer "
+            "your question. A top result is not proof of an answer."
+        )
+    for result in results:
+        st.markdown(
+            f"**#{result.rank}** · page {result.page_number} · {result.chunk_id} "
+            f"· similarity {result.score:.3f}"
+        )
+        st.text(result.text)  # PDF text is untrusted: never render it as Markdown
+    st.caption("Similarity measures closeness of meaning. It does not prove correctness.")
 def main():
     st.set_page_config(page_title="Mini ClassBuild", layout="centered")
     init_state()
     render_header()
+    render_learning_materials()
     render_form()
     render_outline()
 
