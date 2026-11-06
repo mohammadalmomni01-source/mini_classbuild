@@ -17,10 +17,21 @@ from classbuild.services.course_generator import CourseGenerator
 from classbuild.services.lesson_generator import LessonGenerator
 from classbuild.services.structured_output import CourseGenerationError
 from classbuild.services.quiz_generator import QuizGenerator
-from classbuild.rag.document_state import sync_learning_material
-from classbuild.rag.embeddings import EmbeddingError
+from classbuild.rag.document_state import (
+    COURSE_MATERIAL_KEY,
+    DOC_KEY,
+    attach_material_to_course,
+    material_for_course,
+    sync_learning_material,
+)
+from classbuild.rag.embeddings import EmbeddingError, EmbeddingService
+from classbuild.rag.search_state import current_results, get_or_build_index, run_search
 from classbuild.rag.retriever import RetrievalError
-from classbuild.rag.search_state import current_results, run_search
+from classbuild.services.grounded_lesson_generator import (
+    GroundedLessonGenerator,
+    InsufficientEvidenceError,
+)
+from classbuild.services.lesson_state import remove_stale_grounded_lessons
 from classbuild.services.quiz_grader import QuizSubmissionError, grade_quiz
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +44,7 @@ QUIZZES_KEY = "quizzes"
 COURSE_ID_KEY = "course_id"
 RESULTS_KEY = "quiz_results"
 UPLOADER_KEY = "pdf_uploader"
+EVIDENCE_NOTICES_KEY = "evidence_notices"
 LOW_SIMILARITY = 0.30
 ATTEMPTS_KEY = "quiz_attempts"
 
@@ -46,6 +58,8 @@ def new_defaults():
         COURSE_ID_KEY: None,
         RESULTS_KEY: {},
         ATTEMPTS_KEY: {},
+        COURSE_MATERIAL_KEY: None,
+        EVIDENCE_NOTICES_KEY: {},
     }
 
 
@@ -59,7 +73,7 @@ def reset_course_state():
 
 
 def show_generation_error(exc):
-    if isinstance(exc, (GroqClientError, CourseGenerationError)):
+    if isinstance(exc, (GroqClientError, CourseGenerationError, EmbeddingError, RetrievalError)):        
         st.error(str(exc))
         problems = getattr(exc, "problems", None)
         if problems:
@@ -114,7 +128,7 @@ def render_form():
     st.session_state[CONFIG_KEY] = config.to_dict()
     st.session_state[OUTLINE_KEY] = outline
     st.session_state[COURSE_ID_KEY] = uuid.uuid4().hex[:8]
-
+    attach_material_to_course(st.session_state)
 
 def render_outline():
     outline = st.session_state[OUTLINE_KEY]
@@ -140,20 +154,33 @@ def render_outline():
     render_lesson_section(outline)
 
 
-def generate_lesson_content(lesson_number):
+def generate_lesson_content(lesson_number, document=None):
     lessons = st.session_state[LESSONS_KEY]
     if lesson_number in lessons:
         return True  # already generated: no API call
 
+    outline = st.session_state[OUTLINE_KEY]
+    notices = st.session_state[EVIDENCE_NOTICES_KEY]
     try:
         with st.spinner("Generating lesson content..."):
-            content = LessonGenerator().generate_lesson(
-                st.session_state[OUTLINE_KEY], lesson_number
-            )
+            if document is not None:
+                content = generate_grounded_lesson(outline, lesson_number, document)
+            else:
+                content = LessonGenerator().generate_lesson(outline, lesson_number)
+    except InsufficientEvidenceError as exc:
+        # Not an error: the PDF simply does not cover this lesson.
+        notices[lesson_number] = {
+            "message": str(exc),
+            "fingerprint": document.fingerprint,
+            "passages": exc.passages,
+        }
+        st.rerun()  # redraw so the warning and the fallback button appear
+        return False
     except Exception as exc:
         show_generation_error(exc)
         return False
 
+    notices.pop(lesson_number, None)
     lessons[lesson_number] = content
     return True
 
@@ -161,6 +188,9 @@ def generate_lesson_content(lesson_number):
 def render_lesson_section(outline):
     st.divider()
     st.subheader("Lesson content")
+
+    drop_stale_grounded_lessons()
+    document = render_pdf_reference_option()
 
     course_id = st.session_state[COURSE_ID_KEY]
     titles = {lesson.lesson_number: lesson.title for lesson in outline.lessons}
@@ -174,16 +204,17 @@ def render_lesson_section(outline):
 
     lessons = st.session_state[LESSONS_KEY]
     if selected not in lessons:
-        if st.button("Generate Lesson Content", key=f"generate_lesson_{course_id}_{selected}"):
-            generate_lesson_content(selected)
+        render_generate_lesson_buttons(selected, document)
 
     if selected in lessons:
         render_lesson_content(lessons[selected])
         render_quiz_section(selected)
 
-
 def render_lesson_content(content):
     st.markdown(f"### Lesson {content.lesson_number}: {content.title}")
+    if content.is_grounded:
+        pages = ", ".join(str(page) for page in content.cited_pages)
+        st.text(f"Based on {content.grounding.source_filename} · cited page(s): {pages}")
     st.write(content.introduction)
 
     for section in content.sections:
@@ -191,6 +222,9 @@ def render_lesson_content(content):
         st.write(section.explanation)
         st.markdown("**Example**")
         st.code(section.example, language=None, wrap_lines=True)
+        if section.source_ids:
+            labels = ", ".join(source_label(content, item) for item in section.source_ids)
+            st.text(f"Sources: {labels}")
 
     st.markdown("#### Summary")
     st.write(content.summary)
@@ -200,6 +234,9 @@ def render_lesson_content(content):
         st.markdown(f"**Exercise {index}.** {exercise.question}")
         with st.expander(f"Hint for exercise {index}"):
             st.write(exercise.hint)
+
+    if content.is_grounded:
+        render_lesson_sources(content)
 
 def quiz_widget_prefix(lesson_number):
     # Course id + lesson + attempt, so quizzes from different courses,
@@ -415,6 +452,105 @@ def render_search_results(results):
         )
         st.text(result.text)  # PDF text is untrusted: never render it as Markdown
     st.caption("Similarity measures closeness of meaning. It does not prove correctness.")
+
+def current_pdf_fingerprint():
+    document = st.session_state.get(DOC_KEY)
+    return document.fingerprint if document is not None else None
+
+
+def drop_stale_grounded_lessons():
+    """Remove PDF-based lessons whose PDF is no longer loaded."""
+    removed = remove_stale_grounded_lessons(
+        st.session_state[LESSONS_KEY],
+        current_pdf_fingerprint(),
+        st.session_state[QUIZZES_KEY],
+        st.session_state[RESULTS_KEY],
+        st.session_state[ATTEMPTS_KEY],
+    )
+    if removed:
+        numbers = ", ".join(str(number) for number in sorted(removed))
+        st.warning(f"The PDF changed, so the PDF-based lesson(s) {numbers} were removed.")
+
+
+def render_pdf_reference_option():
+    """Checkbox, off by default. Returns the document to ground new lessons in, or None."""
+    document = material_for_course(st.session_state)
+    if document is None:
+        render_course_material_note()
+        return None
+
+    course_id = st.session_state[COURSE_ID_KEY]
+    use_pdf = st.checkbox(
+        "Use Uploaded PDF as Reference",
+        key=f"use_pdf_{course_id}_{document.fingerprint[:12]}",
+        help="New lessons are based on passages from your PDF and show page citations.",
+    )
+    return document if use_pdf else None
+
+
+def render_course_material_note():
+    if st.session_state.get(DOC_KEY) is not None:
+        st.info(
+            "The loaded PDF was not part of this course. "
+            "Generate a new course to use it as reference."
+        )
+
+
+def generate_grounded_lesson(outline, lesson_number, document):
+    service = EmbeddingService()
+    index = get_or_build_index(st.session_state, document, service)  # cached per PDF
+    generator = GroundedLessonGenerator(embeddings=service)
+    return generator.generate_lesson(outline, lesson_number, document, index)
+
+
+def current_evidence_notice(lesson_number):
+    """A lesson's 'not enough evidence' notice, only if it refers to the loaded PDF."""
+    notice = st.session_state[EVIDENCE_NOTICES_KEY].get(lesson_number)
+    if notice and notice["fingerprint"] == current_pdf_fingerprint():
+        return notice
+    return None
+
+
+def render_generate_lesson_buttons(selected, document):
+    course_id = st.session_state[COURSE_ID_KEY]
+    notice = current_evidence_notice(selected) if document is not None else None
+
+    if notice is not None:
+        st.warning(notice["message"])
+        with st.expander("Passages that were checked"):
+            for passage in notice["passages"]:
+                st.text(
+                    f"{passage.chunk_id} · page {passage.page_number} "
+                    f"· similarity {passage.score:.3f}"
+                )
+                st.text(passage.text)
+        if st.button("Generate Without PDF", key=f"generate_plain_{course_id}_{selected}"):
+            if generate_lesson_content(selected, None):
+                st.rerun()
+        return
+
+    label = "Generate Lesson Content (from PDF)" if document is not None else "Generate Lesson Content"
+    if st.button(label, key=f"generate_lesson_{course_id}_{selected}"):
+        generate_lesson_content(selected, document)
+
+
+def source_label(content, source_id):
+    for source in content.grounding.sources:
+        if source.chunk_id == source_id:
+            return f"{source.chunk_id} (page {source.page_number})"
+    return source_id
+
+
+def render_lesson_sources(content):
+    st.markdown("#### Sources")
+    for source in content.grounding.sources:
+        st.text(
+            f"{source.chunk_id} · {source.source_filename} · page {source.page_number} "
+            f"· similarity {source.similarity:.3f}"
+        )
+        with st.expander(f"Show passage {source.chunk_id}"):
+            st.text(source.text)  # PDF text is untrusted: never render it as Markdown
+
 def main():
     st.set_page_config(page_title="Mini ClassBuild", layout="centered")
     init_state()
