@@ -9,4 +9,4 @@ from classbuild.llm.exceptions import (
     MissingAPIKeyError,
     RateLimitError,
 )
-from classbuild.llm.groq_client import GroqClient
+from classbuild.llm.groq_client import ChatText, GroqClient

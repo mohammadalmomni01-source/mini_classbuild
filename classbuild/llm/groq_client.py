@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import dataclass
 
 import groq
 from dotenv import load_dotenv
@@ -21,6 +22,12 @@ DEFAULT_MODEL = "openai/gpt-oss-20b"
 REASONING_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
 
 
+@dataclass(frozen=True)
+class ChatText:
+    text: str
+    finish_reason: str | None  # "length" when the token limit cut the answer
+
+
 class GroqClient:
     def __init__(self, api_key=None, model=None, timeout_seconds=60):
         self.api_key = (api_key or os.getenv("GROQ_API_KEY", "")).strip()
@@ -29,17 +36,18 @@ class GroqClient:
             raise MissingAPIKeyError("GROQ_API_KEY is missing. Add it to your .env file.")
         self._client = groq.Groq(api_key=self.api_key, timeout=timeout_seconds)
 
-    def generate_json(self, prompt, system_prompt, max_completion_tokens=3000):
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-        extra = {"reasoning_effort": "low"} if self.model in REASONING_MODELS else {}
+    def _create(self, messages, max_completion_tokens, reasoning_effort="low",
+                response_format=None):
+        """One chat request. Every SDK error becomes one of our clear errors."""
+        extra = {}
+        if self.model in REASONING_MODELS and reasoning_effort:
+            extra["reasoning_effort"] = reasoning_effort
+        if response_format is not None:
+            extra["response_format"] = response_format
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                response_format={"type": "json_object"},
                 max_completion_tokens=max_completion_tokens,
                 **extra,
             )
@@ -57,8 +65,16 @@ class GroqClient:
             raise GroqAPIError(f"Groq rejected the request: {exc}") from exc
         except groq.APIStatusError as exc:
             raise GroqAPIError(f"Groq returned an error (HTTP {exc.status_code}).") from exc
+        return response.choices[0]
 
-        choice = response.choices[0]
+    def generate_json(self, prompt, system_prompt, max_completion_tokens=3000, history=None):
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history or [])  # earlier chat turns, if any
+        messages.append({"role": "user", "content": prompt})
+
+        choice = self._create(
+            messages, max_completion_tokens, response_format={"type": "json_object"}
+        )
         if choice.finish_reason == "length":
             raise InvalidJSONError("The model's answer was cut off before it finished.")
         text = (choice.message.content or "").strip()
@@ -68,3 +84,16 @@ class GroqClient:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise InvalidJSONError("The model did not return valid JSON.") from exc
+
+    def chat(self, messages, max_completion_tokens=2000):
+        """Multi-turn plain text. The last message must be a non-empty user message."""
+        last = messages[-1] if messages else {}
+        if last.get("role") != "user" or not str(last.get("content", "")).strip():
+            raise ValueError("The last message must be a non-empty user message.")
+
+        choice = self._create(messages, max_completion_tokens)
+        text = (choice.message.content or "").strip()
+        if not text:
+            hint = " It was cut off; try a shorter question." if choice.finish_reason == "length" else ""
+            raise EmptyResponseError("Groq answered with an empty reply." + hint)
+        return ChatText(text=text, finish_reason=choice.finish_reason)
