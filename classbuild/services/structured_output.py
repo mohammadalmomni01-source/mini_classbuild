@@ -32,7 +32,8 @@ def describe_validation_error(exc):
     ]
 
 
-def generate_validated(client, *, prompt, system_prompt, max_completion_tokens, validate, what):
+def generate_validated(client, *, prompt, system_prompt, max_completion_tokens, validate, what,
+                       history=None):
     """Ask Groq for JSON, validate it, and retry once if something is wrong."""
     current_prompt = prompt
     problems = []
@@ -43,6 +44,7 @@ def generate_validated(client, *, prompt, system_prompt, max_completion_tokens, 
                 prompt=current_prompt,
                 system_prompt=system_prompt,
                 max_completion_tokens=max_completion_tokens,
+                history=history,
             )
         except InvalidJSONError as exc:
             logger.warning("Attempt %d/%d gave bad JSON: %s", attempt, MAX_ATTEMPTS, exc)
