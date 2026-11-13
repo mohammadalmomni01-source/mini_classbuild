@@ -64,7 +64,6 @@ LOW_SIMILARITY = 0.30
 ATTEMPTS_KEY = "quiz_attempts"
 CHATS_KEY = "lesson_chats"
 
-
 def new_defaults():
     return {
         CONFIG_KEY: None,
@@ -368,13 +367,13 @@ def render_quiz_result(lesson_number, result):
             st.write(f"Correct answer: {item.correct_text}")
         st.caption(item.explanation)
 
-
-        st.button(
+    st.button(
         "Try Again",
         key=f"retake_{quiz_widget_prefix(lesson_number)}",
         on_click=retake_quiz,
         args=(lesson_number,),
     )
+
 
 def chat_message_caption(message):
     """A small caption under an assistant message: where the answer came from."""
@@ -457,6 +456,7 @@ def render_chat_section(outline, content, document):
             on_click=clear_thread,
             args=(chats, key),
         )
+
 
 def render_learning_materials():
     st.subheader("Learning materials (optional)")
