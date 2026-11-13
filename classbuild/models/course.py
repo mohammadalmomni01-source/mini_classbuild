@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -47,6 +48,14 @@ class CourseOutline(BaseModel):
             raise ValueError(f"expected {count} lessons but got {len(self.lessons)}")
         if difficulty is not None and self.difficulty != difficulty:
             raise ValueError(f"expected difficulty {difficulty} but got {self.difficulty}")
+        return self
+
+    @model_validator(mode="after")
+    def check_unique_lesson_titles(self):
+        """Lesson titles must be different (case- and whitespace-insensitive)."""
+        normalized = [re.sub(r"\s+", " ", lesson.title).strip().lower() for lesson in self.lessons]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Lesson titles must be different")
         return self
 
 

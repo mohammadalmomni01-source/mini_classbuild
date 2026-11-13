@@ -29,6 +29,42 @@ from classbuild.services.structured_output import (
 
 MIN_PASSAGE_SIMILARITY = 0.30  # below this a passage does not count as evidence
 
+# ---------------------------------------------------------------------------
+# Page-mention detection  (shared with lesson_chat.py)
+# ---------------------------------------------------------------------------
+
+PAGE_MENTION = re.compile(
+    r"\b(?:pp?\.|pages?)\s*(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def mentioned_pages(text: str) -> set[int]:
+    """Return the set of page numbers mentioned in *text* (e.g. 'page 3', 'pp. 3', 'p. 3')."""
+    return {int(m.group(1)) for m in PAGE_MENTION.finditer(text)}
+
+
+def uncited_page_mentions(lesson) -> list[str]:
+    """
+    One problem message per page number that is mentioned in the lesson text
+    but is not among the lesson's cited pages.
+    """
+    cited = set(lesson.cited_pages)
+    all_text = " ".join(
+        [lesson.introduction, lesson.summary]
+        + [section.explanation + " " + section.example for section in lesson.sections]
+    )
+    mentioned = mentioned_pages(all_text)
+    return [
+        f"Page {page} is mentioned in the lesson text but is not among the cited pages."
+        for page in sorted(mentioned - cited)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Prompts / constants
+# ---------------------------------------------------------------------------
+
 GROUNDED_SYSTEM_PROMPT = """You are an experienced teacher writing one lesson of a course,
 using passages from an uploaded PDF as reference material.
 Reply with ONE JSON object only, with no extra text, in exactly this shape:
@@ -89,6 +125,11 @@ class InsufficientEvidenceError(CourseGenerationError):
         self.passages = list(passages)
 
 
+# ---------------------------------------------------------------------------
+# Draft model
+# ---------------------------------------------------------------------------
+
+
 def _same_text(a, b):
     return re.sub(r"\s+", " ", a).strip().lower() == re.sub(r"\s+", " ", b).strip().lower()
 
@@ -139,6 +180,11 @@ class GroundedLessonDraft(BaseModel):
         if title is not None and not _same_text(self.title, title):
             raise ValueError(f"expected title '{title}' but got '{self.title}'")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def build_retrieval_query(outline, lesson):
@@ -217,6 +263,15 @@ def draft_to_lesson(draft, allowed, document, retrieval_query):
     }
 
 
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+
+
+class LessonValidationError(ContentValidationError):
+    """A validated lesson still has uncited page mentions."""
+
+
 class GroundedLessonGenerator:
     def __init__(self, client=None, embeddings=None):
         self._client = client
@@ -255,7 +310,7 @@ class GroundedLessonGenerator:
         # 4) Build the lesson from retrieval data and validate every citation.
         data = draft_to_lesson(draft, allowed, document, query)
         try:
-            return validate_lesson(
+            validated = validate_lesson(
                 data,
                 expected_lesson_number=lesson.lesson_number,
                 expected_title=lesson.title,
@@ -267,6 +322,16 @@ class GroundedLessonGenerator:
                 "The AI's lesson did not match your request.",
                 describe_validation_error(exc),
             ) from exc
+
+        # 5) Audit: reject uncited page mentions (Step 10 rule).
+        problems = uncited_page_mentions(validated)
+        if problems:
+            raise LessonValidationError(
+                "The lesson mentions page numbers that are not among its citations.",
+                problems,
+            )
+
+        return validated
 
     def _request_draft(self, prompt, lesson, allowed):
         context = {

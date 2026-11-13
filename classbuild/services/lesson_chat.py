@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 
 from pydantic import (
@@ -16,7 +15,9 @@ from classbuild.models.course import NonEmptyStr
 from classbuild.rag.embeddings import EmbeddingService
 from classbuild.rag.retriever import DEFAULT_TOP_K, search
 from classbuild.services.grounded_lesson_generator import (
+    PAGE_MENTION,
     format_reference_passages,
+    mentioned_pages,
     select_evidence,
     to_source_reference,
 )
@@ -33,7 +34,8 @@ MAX_HISTORY_TURNS = 6
 MAX_HISTORY_MESSAGE_CHARS = 1500
 MAX_COMPLETION_TOKENS = 2000
 
-ID_TOKEN = re.compile(r"\bp\d+-c\d+\b")  # anything that looks like a passage id
+import re as _re
+ID_TOKEN = _re.compile(r"\bp\d+-c\d+\b")  # anything that looks like a passage id
 
 LESSON_SYSTEM_PROMPT = """You are a friendly tutor helping a learner with ONE lesson of a course.
 Answer using the lesson below and the conversation so far. Keep answers short and clear.

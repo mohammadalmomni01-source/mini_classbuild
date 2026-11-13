@@ -1,7 +1,14 @@
+# Groq cloud API client for fast LLM inference
 groq
+# Load environment variables from .env file
 python-dotenv
+# Web framework for interactive browser interface
 streamlit
-pydantic>=2
+# Pydantic v2 schemas for data validation and structured outputs
+pydantic>=2,<3
+# PDF parsing and text extraction
 pypdf>=4.0
+# Local text embeddings for semantic search and retrieval
 sentence-transformers>=3.0
+# Vector math and cosine similarity calculations
 numpy>=1.24

@@ -1,6 +1,23 @@
+# Environment variables and secrets
 .env
-.venv/
-__pycache__/
-*.pyc
 .streamlit/secrets.toml
 !.env.example
+
+# Virtual environment
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Stage 3 generated data and reports
+evaluation_results/
+saved_courses/
+
+# Tool caches and test coverage
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log

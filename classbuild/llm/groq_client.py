@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import groq
@@ -21,6 +22,17 @@ load_dotenv()
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 REASONING_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
 
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+
+_GROQ_KEY_RE = re.compile(r"\bgsk_[A-Za-z0-9]{20,}\b")
+
+
+def redact_secrets(text: str) -> str:
+    """Replace anything that looks like a Groq API key with [redacted]."""
+    return _GROQ_KEY_RE.sub("[redacted]", text)
+
 
 @dataclass(frozen=True)
 class ChatText:
@@ -29,12 +41,31 @@ class ChatText:
 
 
 class GroqClient:
-    def __init__(self, api_key=None, model=None, timeout_seconds=60):
+    def __init__(self, api_key=None, model=None, timeout_seconds=60, max_retries=None):
+        from classbuild.config import get_settings  # local import to avoid circular deps
+
         self.api_key = (api_key or os.getenv("GROQ_API_KEY", "")).strip()
         self.model = (model or os.getenv("GROQ_MODEL", DEFAULT_MODEL)).strip()
         if not self.api_key:
             raise MissingAPIKeyError("GROQ_API_KEY is missing. Add it to your .env file.")
-        self._client = groq.Groq(api_key=self.api_key, timeout=timeout_seconds)
+
+        settings = get_settings()
+        effective_retries = max_retries if max_retries is not None else settings.max_retries
+
+        self._client = groq.Groq(
+            api_key=self.api_key,
+            timeout=timeout_seconds,
+            max_retries=effective_retries,
+        )
+
+    def _error_detail(self, exc) -> str:
+        """Human-readable detail from an APIStatusError, with secrets redacted."""
+        try:
+            body = exc.body or {}
+            message = (body.get("error") or {}).get("message") or str(exc)
+        except Exception:
+            message = str(exc)
+        return redact_secrets(message)
 
     def _create(self, messages, max_completion_tokens, reasoning_effort="low",
                 response_format=None):
@@ -62,9 +93,13 @@ class GroqClient:
         except groq.BadRequestError as exc:
             if "json_validate_failed" in str(exc):
                 raise InvalidJSONError("The model did not return valid JSON.") from exc
-            raise GroqAPIError(f"Groq rejected the request: {exc}") from exc
+            raise GroqAPIError(
+                f"Groq rejected the request: {redact_secrets(str(exc))}"
+            ) from exc
         except groq.APIStatusError as exc:
-            raise GroqAPIError(f"Groq returned an error (HTTP {exc.status_code}).") from exc
+            raise GroqAPIError(
+                f"Groq returned an error (HTTP {exc.status_code}): {self._error_detail(exc)}"
+            ) from exc
         return response.choices[0]
 
     def generate_json(self, prompt, system_prompt, max_completion_tokens=3000, history=None):
