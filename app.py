@@ -33,6 +33,21 @@ from classbuild.services.grounded_lesson_generator import (
 )
 from classbuild.services.lesson_state import remove_stale_grounded_lessons
 from classbuild.services.quiz_grader import QuizSubmissionError, grade_quiz
+from classbuild.services.chat_state import (
+    append_exchange,
+    clear_thread,
+    get_history,
+    prune_chats,
+    thread_key,
+    valid_thread_keys,
+)
+from classbuild.services.lesson_chat import (
+    ChatAnswerError,
+    ChatInputError,
+    LessonChatContext,
+    LessonChatService,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -47,6 +62,8 @@ UPLOADER_KEY = "pdf_uploader"
 EVIDENCE_NOTICES_KEY = "evidence_notices"
 LOW_SIMILARITY = 0.30
 ATTEMPTS_KEY = "quiz_attempts"
+CHATS_KEY = "lesson_chats"
+
 
 def new_defaults():
     return {
@@ -60,6 +77,7 @@ def new_defaults():
         ATTEMPTS_KEY: {},
         COURSE_MATERIAL_KEY: None,
         EVIDENCE_NOTICES_KEY: {},
+        CHATS_KEY: {},
     }
 
 
@@ -190,6 +208,7 @@ def render_lesson_section(outline):
     st.subheader("Lesson content")
 
     drop_stale_grounded_lessons()
+    prune_stale_chats()
     document = render_pdf_reference_option()
 
     course_id = st.session_state[COURSE_ID_KEY]
@@ -208,6 +227,7 @@ def render_lesson_section(outline):
 
     if selected in lessons:
         render_lesson_content(lessons[selected])
+        render_chat_section(outline, lessons[selected], document)
         render_quiz_section(selected)
 
 def render_lesson_content(content):
@@ -348,12 +368,95 @@ def render_quiz_result(lesson_number, result):
             st.write(f"Correct answer: {item.correct_text}")
         st.caption(item.explanation)
 
-    st.button(
+
+        st.button(
         "Try Again",
         key=f"retake_{quiz_widget_prefix(lesson_number)}",
         on_click=retake_quiz,
         args=(lesson_number,),
     )
+
+def chat_message_caption(message):
+    """A small caption under an assistant message: where the answer came from."""
+    if message.role != "assistant":
+        return None
+    if message.mode == "pdf":
+        if message.status == "answered":
+            pages = ", ".join(str(page) for page in message.cited_pages)
+            return f"From the uploaded PDF · cited page(s): {pages}"
+        return "The uploaded PDF did not have enough evidence to answer this."
+    if message.truncated:
+        return "The answer was cut off by the length limit."
+    return None
+
+
+def render_chat_message(message):
+    with st.chat_message(message.role):
+        st.markdown(message.content)
+        caption = chat_message_caption(message)
+        if caption:
+            st.caption(caption)
+
+
+def chat_index_for(document):
+    """The cached embedding index for the chat's PDF mode, or (None, None) in lesson mode."""
+    if document is None:
+        return None, None
+    embeddings = EmbeddingService()
+    index = get_or_build_index(st.session_state, document, embeddings)
+    return embeddings, index
+
+
+def chat_thread_id(key):
+    """A short, stable string for Streamlit widget keys."""
+    return "_".join(str(part) for part in key)
+
+
+def render_chat_section(outline, content, document):
+    st.divider()
+    st.subheader("Ask about this lesson")
+    st.caption(
+        "Answers are grounded in the uploaded PDF, with checked citations."
+        if document is not None
+        else "Answers use this lesson's content and your recent messages."
+    )
+
+    try:
+        ctx = LessonChatContext.from_course(outline, content.lesson_number, content)
+    except ChatAnswerError as exc:
+        st.info(str(exc))
+        return
+
+    course_id = st.session_state[COURSE_ID_KEY]
+    chats = st.session_state[CHATS_KEY]
+    key = thread_key(course_id, content, document.fingerprint if document is not None else None)
+    history = get_history(chats, key)
+    thread_id = chat_thread_id(key)
+
+    for message in history:
+        render_chat_message(message)
+
+    question = st.chat_input("Ask a question about this lesson", key=f"chat_input_{thread_id}")
+    if question:
+        try:
+            embeddings, index = chat_index_for(document)
+            service = LessonChatService(embeddings=embeddings)
+            reply = service.answer(ctx, question, history=history, document=document, index=index)
+        except ChatInputError as exc:
+            st.warning(str(exc))
+        except Exception as exc:
+            show_generation_error(exc)
+        else:
+            append_exchange(chats, key, reply.question, reply.answer)
+            st.rerun()
+
+    if history:
+        st.button(
+            "Clear Chat",
+            key=f"clear_chat_{thread_id}",
+            on_click=clear_thread,
+            args=(chats, key),
+        )
 
 def render_learning_materials():
     st.subheader("Learning materials (optional)")
@@ -470,6 +573,16 @@ def drop_stale_grounded_lessons():
     if removed:
         numbers = ", ".join(str(number) for number in sorted(removed))
         st.warning(f"The PDF changed, so the PDF-based lesson(s) {numbers} were removed.")
+
+
+def prune_stale_chats():
+    """Drop saved chats for lessons that no longer exist, or for a PDF that is no longer loaded."""
+    valid = valid_thread_keys(
+        st.session_state[COURSE_ID_KEY],
+        st.session_state[LESSONS_KEY],
+        current_pdf_fingerprint(),
+    )
+    prune_chats(st.session_state[CHATS_KEY], valid)
 
 
 def render_pdf_reference_option():
